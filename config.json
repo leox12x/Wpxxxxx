@@ -1,8 +1,8 @@
 {
-  "botName": "GoatWpBot",
-  "prefix": ".",
+  "botName": "Dora",
+  "prefix": "!",
   "skipSync": true,
-  "admins": ["8801000000000@s.whatsapp.net"],
+  "admins": ["8801723153138@s.whatsapp.net"],
   "dashboard": {
     "enabled": true,
     "port": 3000,
