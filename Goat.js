@@ -181,15 +181,32 @@ global.utils = require("./utils/utils");
 const originalLoggerLevel = logger.level;
 logger.setLevel("debug");
 
-async function promptLoginMethod() {
-  printBanner();
-  console.log(chalk.cyan("\n" + "=".repeat(50)));
-  console.log(chalk.cyan.bold("           🔐 AUTHENTICATION REQUIRED"));
-  console.log(chalk.cyan("=".repeat(50)));
-  console.log(chalk.yellow("Automatically selecting: 📂 Re-import legacy session file\n"));
+// Check if session folder has valid credentials
+async function hasValidSession(sessionPath) {
+  try {
+    const credsPath = path.join(sessionPath, "creds.json");
+    
+    if (!(await fs.pathExists(credsPath))) {
+      logger.info("⚠️ No creds.json found in session folder");
+      return false;
+    }
 
-  // Automatically return 'session-file' without prompting
-  return "session-file";
+    // Read and validate creds.json
+    const credsContent = await fs.readFile(credsPath, "utf8");
+    const creds = JSON.parse(credsContent);
+
+    // Check if creds has required fields
+    if (!creds.me || !creds.me.id) {
+      logger.info("⚠️ Invalid creds.json structure");
+      return false;
+    }
+
+    logger.info("✅ Valid session found");
+    return true;
+  } catch (error) {
+    logger.error("❌ Error checking session validity:", error.message);
+    return false;
+  }
 }
 
 // Database
@@ -206,48 +223,75 @@ async function connectDatabase() {
 }
 
 // Auth-aware connection logic
-
 async function ensureAuthenticated() {
   const sessionPath = path.join(__dirname, "session");
 
-  // Check and create session folder silently
+  // Check and create session folder if needed
   try {
     if (!(await fs.pathExists(sessionPath))) {
-      await fs.mkdir(sessionPath);
-      global.GoatBot.sessionValid = false;
-      global.GoatBot.connectionStatus = "awaiting-login";
-      global.GoatBot.authMethod = await promptLoginMethod();
+      await fs.mkdir(sessionPath, { recursive: true });
+      logger.info("📁 Session folder created");
     }
+
+    // Check if we have a valid session
+    const hasSession = await hasValidSession(sessionPath);
+    
+    if (!hasSession) {
+      logger.info("⚠️ No valid session found. Please place your creds.json in the session folder");
+      logger.info("📂 Session folder path:", sessionPath);
+      logger.info("⏳ Waiting for valid session file...");
+      
+      // Wait for user to add the session file
+      await waitForSessionFile(sessionPath);
+    }
+
+    global.GoatBot.sessionValid = true;
+    global.GoatBot.authMethod = "session-file";
+    
   } catch (error) {
-    // Log to console for debugging, bypassing silent mode
     console.error(
-      chalk.red("❌ Failed to create session folder:"),
+      chalk.red("❌ Failed to prepare session folder:"),
       error.message
     );
     global.GoatBot.stats.errors++;
-    // Instead of restarting, retry authentication
-    global.GoatBot.connectionStatus = "awaiting-login";
-    global.GoatBot.authMethod = await promptLoginMethod();
+    throw error;
   }
 
+  // Try to connect with the session
   while (true) {
     try {
       global.GoatBot.connectionStatus = "connecting";
-      await connect({ method: global.GoatBot.authMethod });
+      logger.info("🔄 Connecting to WhatsApp with existing session...");
+      
+      await connect({ method: "session-file" });
+      
       global.GoatBot.isConnected = true;
       global.GoatBot.sessionValid = true;
       global.GoatBot.connectionStatus = "connected";
-      restartAttempts = 0; // Reset restart attempts on success
+      restartAttempts = 0;
+      
+      logger.info("✅ Successfully connected to WhatsApp!");
       return;
+      
     } catch (err) {
-      // Log error to console for debugging, bypassing silent mode
       console.error(chalk.red("❌ Connection error:"), err.message);
       global.GoatBot.stats.errors++;
-      if (err === AUTH_ERROR || err.message === "Session expired") {
-        global.GoatBot.isConnected = false;
-        global.GoatBot.sessionValid = false;
-        global.GoatBot.connectionStatus = "awaiting-login";
-        global.GoatBot.authMethod = await promptLoginMethod();
+      
+      if (err === AUTH_ERROR || err.message === "Session expired" || err.message?.includes("auth")) {
+        logger.error("🔑 Authentication failed. Your session may be expired or invalid.");
+        logger.info("Please get a new session and place creds.json in:", sessionPath);
+        
+        // Clear invalid session
+        try {
+          await fs.emptyDir(sessionPath);
+          logger.info("🗑️ Cleared invalid session");
+        } catch (clearErr) {
+          logger.error("Failed to clear session:", clearErr.message);
+        }
+        
+        // Wait for new session
+        await waitForSessionFile(sessionPath);
+        
       } else {
         if (restartAttempts >= MAX_RESTART_ATTEMPTS) {
           console.error(
@@ -263,10 +307,27 @@ async function ensureAuthenticated() {
             `⚠️ Restart attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS}`
           )
         );
-        gracefulRestart();
+        
+        // Wait before retry
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
   }
+}
+
+// Wait for session file to be placed
+async function waitForSessionFile(sessionPath) {
+  const credsPath = path.join(sessionPath, "creds.json");
+  
+  return new Promise((resolve) => {
+    const checkInterval = setInterval(async () => {
+      if (await hasValidSession(sessionPath)) {
+        clearInterval(checkInterval);
+        logger.info("✅ Valid session file detected!");
+        resolve();
+      }
+    }, 3000); // Check every 3 seconds
+  });
 }
 
 function invalidateSessionAndRestart() {
@@ -358,15 +419,6 @@ function watchPlugins() {
 }
 
 async function start() {
-  // Run session cleanup before starting
-  // try {
-  //   const { SessionCleaner } = require("./utils/sessionCleaner");
-  //   const sessionCleaner = new SessionCleaner();
-  //   await sessionCleaner.cleanCorruptedSessions();
-  // } catch (error) {
-  //   logger.warn("⚠️ Session cleanup failed:", error.message);
-  // }
-
   // Defer database connection and dashboard start until after authentication
   await ensureAuthenticated();
 
@@ -423,8 +475,8 @@ async function start() {
 
 async function printStartupSummary() {
   const { user, commands, events } = global.GoatBot;
-  const botName = user.name || config.botName || "GoatBot";
-  const botNumber = user.id?.split(":")[0] || "Not available";
+  const botName = user?.name || config.botName || "GoatBot";
+  const botNumber = user?.id?.split(":")[0] || "Not available";
   const dbStats = await db.getStats();
 
   logger.info(chalk.yellow("" + "=".repeat(50)));
@@ -586,4 +638,4 @@ process.on("unhandledRejection", (reason, promise) => {
   );
   gracefulRestart();
 });
-      
+        
